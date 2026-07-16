@@ -654,30 +654,138 @@ function toDarkness(data, w, h){
   return g;
 }
 
-/* うずまき1本せんの通り道を作る
-   rings = まきの数(バーの「こまかさ」)。
-   くらい場所ほど せんが はやく大きくゆれて、こく見える仕組み */
-function buildSpiralPath(dark, w, h, rings){
-  const cx = w / 2, cy = h / 2;
-  const Rmax = Math.sqrt(cx * cx + cy * cy);
-  const spacing = Rmax / rings;
-  const TAU = Math.PI * 2;
-  const pts = [];
-  let theta = 0, phase = 0;
-  while (theta < rings * TAU){
-    const r = spacing * theta / TAU;
-    theta += 1.4 / Math.max(6, r);   /* せんの上を約1.4ピクセルずつすすむ */
-    const bx = cx + r * Math.cos(theta);
-    const by = cy + r * Math.sin(theta);
-    let d = 0;
-    const ix = bx | 0, iy = by | 0;
-    if (ix >= 0 && iy >= 0 && ix < w && iy < h) d = dark[iy * w + ix];
-    phase += 0.35 + d * 2.3;          /* くらいほど はやくゆれる */
-    const rr = r + spacing * 0.46 * Math.pow(d, 0.8) * Math.sin(phase);  /* くらいほど 大きくゆれる */
-    pts.push(cx + rr * Math.cos(theta), cy + rr * Math.sin(theta));
-    if (pts.length > 1500000) break;  /* 安全そうち */
+/* 「くらさマップ」から、りんかく(エッジ)の つよさを もとめる(ソーベルほう) */
+function edgeStrength(dark, w, h){
+  const n = w * h;
+  const g = new Float32Array(n);
+  const at = (x, y) => dark[clamp(y, 0, h - 1) * w + clamp(x, 0, w - 1)];
+  for (let y = 0; y < h; y++){
+    for (let x = 0; x < w; x++){
+      const gx = -at(x-1,y-1) - 2*at(x-1,y) - at(x-1,y+1) + at(x+1,y-1) + 2*at(x+1,y) + at(x+1,y+1);
+      const gy = -at(x-1,y-1) - 2*at(x,y-1) - at(x+1,y-1) + at(x-1,y+1) + 2*at(x,y+1) + at(x+1,y+1);
+      g[y * w + x] = Math.sqrt(gx * gx + gy * gy);
+    }
   }
-  return new Float32Array(pts);
+  /* よわい階調(かげ・グラデーション)は切りすて、つよい りんかくだけを 0〜1 にひきのばす */
+  const sorted = Float32Array.from(g).sort();
+  const lo = sorted[Math.floor(n * 0.75)];
+  const hi = sorted[Math.min(n - 1, Math.floor(n * 0.995))];
+  const span = Math.max(0.001, hi - lo);
+  for (let p = 0; p < n; p++){
+    const v = (g[p] - lo) / span;
+    g[p] = Math.pow(clamp(v, 0, 1), 1.6);   /* つよい りんかくほど めだつように */
+  }
+  return g;
+}
+
+/* りんかくの つよいところに たくさん「点」をおく(ドット絵の「ディザ」とおなじしくみ) */
+function scatterPointsOnEdges(importance, w, h, targetCount){
+  const n = w * h;
+  let sum = 0;
+  for (let p = 0; p < n; p++) sum += importance[p];
+  if (sum <= 0) return [];
+  const k = targetCount / sum;
+  const buf = new Float32Array(n);
+  for (let p = 0; p < n; p++) buf[p] = importance[p] * k;
+  const pts = [];
+  for (let y = 0; y < h; y++){
+    for (let x = 0; x < w; x++){
+      const p = y * w + x;
+      const v = buf[p];
+      const put = v >= 0.5 ? 1 : 0;
+      if (put) pts.push(x + 0.5, y + 0.5);
+      const err = v - put;
+      if (x + 1 < w) buf[p + 1] += err * 7 / 16;
+      if (y + 1 < h){
+        if (x > 0) buf[p + w - 1] += err * 3 / 16;
+        buf[p + w] += err * 5 / 16;
+        if (x + 1 < w) buf[p + w + 1] += err * 1 / 16;
+      }
+    }
+  }
+  return pts;
+}
+
+/* 点を「今いる場所から いちばん近い、まだ とおっていない点」の じゅんに つなげて
+   1本のせんの通り道にする(ちかくの点をはやく見つけるため、マスにくばって さがす) */
+function orderPointsOneStroke(ptsXY, w, h){
+  const n = ptsXY.length / 2;
+  if (n <= 1) return Float32Array.from(ptsXY);
+  const cell = Math.max(2, Math.sqrt((w * h) / n));
+  const gw = Math.max(1, Math.ceil(w / cell));
+  const gh = Math.max(1, Math.ceil(h / cell));
+  const cellXY = (i) => [
+    Math.min(gw - 1, Math.max(0, (ptsXY[i * 2] / cell) | 0)),
+    Math.min(gh - 1, Math.max(0, (ptsXY[i * 2 + 1] / cell) | 0))
+  ];
+  const buckets = new Map();
+  for (let i = 0; i < n; i++){
+    const [cx, cy] = cellXY(i);
+    const key = cy * gw + cx;
+    let arr = buckets.get(key);
+    if (!arr){ arr = []; buckets.set(key, arr); }
+    arr.push(i);
+  }
+  function removeFromBucket(i){
+    const [cx, cy] = cellXY(i);
+    const arr = buckets.get(cy * gw + cx);
+    const idx = arr.indexOf(i);
+    arr[idx] = arr[arr.length - 1];
+    arr.pop();
+  }
+
+  const order = new Int32Array(n);
+  let cur = 0;
+  order[0] = cur;
+  removeFromBucket(cur);
+
+  for (let step = 1; step < n; step++){
+    const cx = ptsXY[cur * 2], cy = ptsXY[cur * 2 + 1];
+    const [gcx, gcy] = cellXY(cur);
+    let best = -1, bestD = Infinity;
+    const maxRadius = Math.max(gw, gh);
+    for (let radius = 0; radius <= maxRadius; radius++){
+      const x0 = Math.max(0, gcx - radius), x1 = Math.min(gw - 1, gcx + radius);
+      const y0 = Math.max(0, gcy - radius), y1 = Math.min(gh - 1, gcy + radius);
+      for (let gy = y0; gy <= y1; gy++){
+        const onYEdge = (gy === y0 || gy === y1);
+        for (let gx = x0; gx <= x1; gx++){
+          if (radius > 0 && !onYEdge && gx !== x0 && gx !== x1) continue;
+          const arr = buckets.get(gy * gw + gx);
+          if (!arr) continue;
+          for (let m = 0; m < arr.length; m++){
+            const p = arr[m];
+            const dx = ptsXY[p * 2] - cx, dy = ptsXY[p * 2 + 1] - cy;
+            const d = dx * dx + dy * dy;
+            if (d < bestD){ bestD = d; best = p; }
+          }
+        }
+      }
+      if (best !== -1 && Math.sqrt(bestD) <= radius * cell) break;
+    }
+    order[step] = best;
+    removeFromBucket(best);
+    cur = best;
+  }
+
+  const out = new Float32Array(n * 2);
+  for (let i = 0; i < n; i++){
+    out[i * 2] = ptsXY[order[i] * 2];
+    out[i * 2 + 1] = ptsXY[order[i] * 2 + 1];
+  }
+  return out;
+}
+
+/* 写真の「りんかく」を見つけて、それをなぞる1本せんの通り道を作る
+   detailLevel = バーの「こまかさ」(30〜150)。大きいほど点が多く、こまかくなる */
+function buildTracePath(dark, w, h, detailLevel){
+  const edges = edgeStrength(dark, w, h);
+  const diag = Math.sqrt(w * w + h * h);
+  const density = clamp((detailLevel - 30) / 120, 0, 1);
+  const spacingPx = diag / 40 - density * (diag / 40 - diag / 160);
+  const targetCount = clamp(Math.round((w * h) / (spacingPx * spacingPx)), 80, 6000);
+  const pts = scatterPointsOnEdges(edges, w, h, targetCount);
+  return orderPointsOneStroke(pts, w, h);
 }
 
 /* =====================================================
@@ -1198,12 +1306,12 @@ if (typeof document !== "undefined"){
     renderStroke(true);
   }
 
-  function strokeStyleSetup(rings){
+  function strokeStyleSetup(nPts){
     ctx2.fillStyle = "rgb(251,247,238)";
     ctx2.fillRect(0, 0, cv2.width, cv2.height);
     ctx2.strokeStyle = "rgb(57,50,44)";
-    const spacing = Math.sqrt(cv2.width * cv2.width + cv2.height * cv2.height) / 2 / rings;
-    ctx2.lineWidth = Math.min(2.2, Math.max(0.6, spacing * 0.22));
+    const spacing = nPts > 0 ? Math.sqrt((cv2.width * cv2.height) / nPts) : 4;
+    ctx2.lineWidth = Math.min(2.2, Math.max(0.6, spacing * 0.5));
     ctx2.lineJoin = "round";
     ctx2.lineCap = "round";
   }
@@ -1218,14 +1326,10 @@ if (typeof document !== "undefined"){
   function renderStroke(animate){
     if (!state.strokeGray) return;
     const my = ++strokeAbort;
-    /* バーの値(30〜150)を、この画像でつぶれない範囲(30〜上限)に あてはめる */
-    const maxRings = Math.max(34, Math.floor(Math.sqrt(cv2.width * cv2.width + cv2.height * cv2.height) / 2 / 4.2));
-    const top = Math.min(150, maxRings);
-    const v = +$("detailBar").value;
-    const rings = Math.round(30 + (v - 30) * (top - 30) / 120);
-    strokePts = buildSpiralPath(state.strokeGray, state.strokeW, state.strokeH, rings);
+    const v = +$("detailBar").value;   /* バーの値(30〜150)。大きいほど点が多く、こまかくなる */
+    strokePts = buildTracePath(state.strokeGray, state.strokeW, state.strokeH, v);
     const nPts = strokePts.length / 2;
-    strokeStyleSetup(rings);
+    strokeStyleSetup(nPts);
     if (!animate || reduceMotion || nPts < 4){
       drawSeg(0, nPts);
       return;

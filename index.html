@@ -821,13 +821,12 @@ function scatterPointsOnEdges(importance, w, h, targetCount){
   return pts;
 }
 
-/* 点を「今いる場所から いちばん近い、まだ とおっていない点」の じゅんに つなげて
-   1本のせんの通り道にする(ちかくの点をはやく見つけるため、マスにくばって さがす)。
-   もどりち: pts=じゅんばんに ならべた点、breaks=とても長い とびこし(=べつの もようへの
-   ジャンプ)の 場所。あとで ここだけ ペンを上げて、線が ぐちゃぐちゃに交差しないようにする */
+/* 点を「今いる場所から いちばん近い、まだ とおっていない点」の じゅんに つなげて、
+   さいしょから さいごまで とぎれない 1本のせんの通り道にする
+   (ちかくの点をはやく見つけるため、マスにくばって さがす) */
 function orderPointsOneStroke(ptsXY, w, h){
   const n = ptsXY.length / 2;
-  if (n <= 1) return { pts: Float32Array.from(ptsXY), breaks: new Uint8Array(n) };
+  if (n <= 1) return Float32Array.from(ptsXY);
   const cell = Math.max(2, Math.sqrt((w * h) / n));
   const gw = Math.max(1, Math.ceil(w / cell));
   const gh = Math.max(1, Math.ceil(h / cell));
@@ -890,55 +889,39 @@ function orderPointsOneStroke(ptsXY, w, h){
     out[i * 2] = ptsXY[order[i] * 2];
     out[i * 2 + 1] = ptsXY[order[i] * 2 + 1];
   }
-
-  /* すすんだ きょりが、いつもの きょりより ずっと長い場所を「とびこし」とする */
-  const breaks = new Uint8Array(n);
-  if (n > 2){
-    const segDist = new Float32Array(n - 1);
-    for (let i = 0; i < n - 1; i++){
-      segDist[i] = Math.hypot(out[(i + 1) * 2] - out[i * 2], out[(i + 1) * 2 + 1] - out[i * 2 + 1]);
-    }
-    const sortedD = Float32Array.from(segDist).sort();
-    const median = sortedD[Math.floor(sortedD.length / 2)] || cell;
-    const jumpT = Math.max(median * 2.8, cell * 2.2);
-    for (let i = 0; i < n - 1; i++){
-      if (segDist[i] > jumpT) breaks[i + 1] = 1;
-    }
-  }
-  return { pts: out, breaks };
+  return out;
 }
 
 /* かくかくの点つなぎを、「糸」のような なめらかな曲線にする(カトマル・ロムほう)。
    おれまがるところが とがらず、まるく つながるようになる。
-   breaksIn で しめされた「とびこし」の場所は、曲線でつながず ペンをあげる */
-function threadSmooth(ptsXY, breaksIn){
+   さいごまで とぎれない 1本のせんに なるよう、とちゅうで ペンは あげない */
+function threadSmooth(ptsXY){
   const n = ptsXY.length / 2;
-  const breaks = breaksIn || new Uint8Array(n);
-  if (n < 3) return { pts: Float32Array.from(ptsXY), breaks: Uint8Array.from(breaks) };
+  if (n < 3) return Float32Array.from(ptsXY);
   const at = (i) => {
     const c = clamp(i, 0, n - 1);
     return [ptsXY[c * 2], ptsXY[c * 2 + 1]];
   };
-  const outPts = [ptsXY[0], ptsXY[1]];
-  const outBreaks = [0];
+  const out = [ptsXY[0], ptsXY[1]];
   for (let i = 0; i < n - 1; i++){
-    if (breaks[i + 1]){
-      outPts.push(ptsXY[(i + 1) * 2], ptsXY[(i + 1) * 2 + 1]);
-      outBreaks.push(1);
-      continue;
-    }
     const p0 = at(i - 1), p1 = at(i), p2 = at(i + 1), p3 = at(i + 2);
-    const dist = Math.hypot(p2[0] - p1[0], p2[1] - p1[1]);
+    const dx = p2[0] - p1[0], dy = p2[1] - p1[1];
+    const dist = Math.hypot(dx, dy);
     const steps = clamp(Math.round(dist / 2.5), 1, 24);   /* 長いくぎりほど、こまかく分ける */
+    /* まわりの点から あまり まがり具合が わからない「とおい とびこし」でも、
+       まっすぐな線に ならないよう、いとを たわませるように そっと弧を つける */
+    const perpX = dist > 1e-6 ? -dy / dist : 0, perpY = dist > 1e-6 ? dx / dist : 0;
+    const bow = Math.min(dist * 0.16, 26) * (i % 2 === 0 ? 1 : -1);
     for (let s = 1; s <= steps; s++){
       const t = s / steps, t2 = t * t, t3 = t2 * t;
-      const x = 0.5 * ((2 * p1[0]) + (-p0[0] + p2[0]) * t + (2 * p0[0] - 5 * p1[0] + 4 * p2[0] - p3[0]) * t2 + (-p0[0] + 3 * p1[0] - 3 * p2[0] + p3[0]) * t3);
-      const y = 0.5 * ((2 * p1[1]) + (-p0[1] + p2[1]) * t + (2 * p0[1] - 5 * p1[1] + 4 * p2[1] - p3[1]) * t2 + (-p0[1] + 3 * p1[1] - 3 * p2[1] + p3[1]) * t3);
-      outPts.push(x, y);
-      outBreaks.push(0);
+      let x = 0.5 * ((2 * p1[0]) + (-p0[0] + p2[0]) * t + (2 * p0[0] - 5 * p1[0] + 4 * p2[0] - p3[0]) * t2 + (-p0[0] + 3 * p1[0] - 3 * p2[0] + p3[0]) * t3);
+      let y = 0.5 * ((2 * p1[1]) + (-p0[1] + p2[1]) * t + (2 * p0[1] - 5 * p1[1] + 4 * p2[1] - p3[1]) * t2 + (-p0[1] + 3 * p1[1] - 3 * p2[1] + p3[1]) * t3);
+      const sway = Math.sin(Math.PI * t) * bow;
+      x += perpX * sway; y += perpY * sway;
+      out.push(x, y);
     }
   }
-  return { pts: Float32Array.from(outPts), breaks: Uint8Array.from(outBreaks) };
+  return Float32Array.from(out);
 }
 
 /* しゃしんの まん中あたりを、はしっこよりも 大じにする(まんなかに いることが多い
@@ -971,8 +954,8 @@ function buildTracePath(dark, colorR, colorG, colorB, w, h, detailLevel){
   const targetCount = clamp(Math.round((w * h) / (spacingPx * spacingPx) * 2.3), 80, 9000);
   const pts = scatterPointsOnEdges(edges, w, h, targetCount);
   const ordered = orderPointsOneStroke(pts, w, h);
-  const smoothed = threadSmooth(ordered.pts, ordered.breaks);
-  return { drawPts: smoothed.pts, drawBreaks: smoothed.breaks, rawCount: ordered.pts.length / 2 };
+  const smoothed = threadSmooth(ordered);
+  return { drawPts: smoothed, rawCount: ordered.length / 2 };
 }
 
 /* =====================================================
@@ -1458,7 +1441,6 @@ if (typeof document !== "undefined"){
   /* ---------- いっぴつがきモード ---------- */
   let strokeAbort = 0;
   let strokePts = null;
-  let strokeBreaks = null;
 
   async function processStroke(file){
     const myGen = ++state.gen;
@@ -1517,15 +1499,7 @@ if (typeof document !== "undefined"){
   function drawSeg(fromIdx, toIdx){
     ctx2.beginPath();
     ctx2.moveTo(strokePts[fromIdx * 2], strokePts[fromIdx * 2 + 1]);
-    for (let i = fromIdx + 1; i < toIdx; i++){
-      if (strokeBreaks && strokeBreaks[i]){
-        ctx2.stroke();
-        ctx2.beginPath();
-        ctx2.moveTo(strokePts[i * 2], strokePts[i * 2 + 1]);
-      }else{
-        ctx2.lineTo(strokePts[i * 2], strokePts[i * 2 + 1]);
-      }
-    }
+    for (let i = fromIdx + 1; i < toIdx; i++) ctx2.lineTo(strokePts[i * 2], strokePts[i * 2 + 1]);
     ctx2.stroke();
   }
 
@@ -1535,7 +1509,6 @@ if (typeof document !== "undefined"){
     const v = +$("detailBar").value;   /* バーの値(30〜150)。大きいほど点が多く、こまかくなる */
     const built = buildTracePath(state.strokeGray, state.strokeR, state.strokeG, state.strokeB, state.strokeW, state.strokeH, v);
     strokePts = built.drawPts;
-    strokeBreaks = built.drawBreaks;
     const nPts = strokePts.length / 2;
     strokeStyleSetup(built.rawCount);
     if (!animate || reduceMotion || nPts < 4){

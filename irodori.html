@@ -776,8 +776,34 @@ function orderPointsOneStroke(ptsXY, w, h){
   return out;
 }
 
+/* かくかくの点つなぎを、「糸」のような なめらかな曲線にする(カトマル・ロムほう)。
+   おれまがるところが とがらず、まるく つながるようになる */
+function threadSmooth(ptsXY){
+  const n = ptsXY.length / 2;
+  if (n < 3) return Float32Array.from(ptsXY);
+  const at = (i) => {
+    const c = clamp(i, 0, n - 1);
+    return [ptsXY[c * 2], ptsXY[c * 2 + 1]];
+  };
+  const out = [];
+  for (let i = 0; i < n - 1; i++){
+    const p0 = at(i - 1), p1 = at(i), p2 = at(i + 1), p3 = at(i + 2);
+    const dist = Math.hypot(p2[0] - p1[0], p2[1] - p1[1]);
+    const steps = clamp(Math.round(dist / 2.5), 1, 24);   /* 長いくぎりほど、こまかく分ける */
+    for (let s = 0; s < steps; s++){
+      const t = s / steps, t2 = t * t, t3 = t2 * t;
+      const x = 0.5 * ((2 * p1[0]) + (-p0[0] + p2[0]) * t + (2 * p0[0] - 5 * p1[0] + 4 * p2[0] - p3[0]) * t2 + (-p0[0] + 3 * p1[0] - 3 * p2[0] + p3[0]) * t3);
+      const y = 0.5 * ((2 * p1[1]) + (-p0[1] + p2[1]) * t + (2 * p0[1] - 5 * p1[1] + 4 * p2[1] - p3[1]) * t2 + (-p0[1] + 3 * p1[1] - 3 * p2[1] + p3[1]) * t3);
+      out.push(x, y);
+    }
+  }
+  out.push(ptsXY[(n - 1) * 2], ptsXY[(n - 1) * 2 + 1]);
+  return Float32Array.from(out);
+}
+
 /* 写真の「りんかく」を見つけて、それをなぞる1本せんの通り道を作る
-   detailLevel = バーの「こまかさ」(30〜150)。大きいほど点が多く、こまかくなる */
+   detailLevel = バーの「こまかさ」(30〜150)。大きいほど点が多く、こまかくなる
+   もどりち: drawPts=じっさいに描く(なめらかにした)点、rawCount=もとの点の数(線の太さの計算につかう) */
 function buildTracePath(dark, w, h, detailLevel){
   const edges = edgeStrength(dark, w, h);
   const diag = Math.sqrt(w * w + h * h);
@@ -785,7 +811,8 @@ function buildTracePath(dark, w, h, detailLevel){
   const spacingPx = diag / 40 - density * (diag / 40 - diag / 160);
   const targetCount = clamp(Math.round((w * h) / (spacingPx * spacingPx)), 80, 6000);
   const pts = scatterPointsOnEdges(edges, w, h, targetCount);
-  return orderPointsOneStroke(pts, w, h);
+  const ordered = orderPointsOneStroke(pts, w, h);
+  return { drawPts: threadSmooth(ordered), rawCount: ordered.length / 2 };
 }
 
 /* =====================================================
@@ -1327,9 +1354,10 @@ if (typeof document !== "undefined"){
     if (!state.strokeGray) return;
     const my = ++strokeAbort;
     const v = +$("detailBar").value;   /* バーの値(30〜150)。大きいほど点が多く、こまかくなる */
-    strokePts = buildTracePath(state.strokeGray, state.strokeW, state.strokeH, v);
+    const built = buildTracePath(state.strokeGray, state.strokeW, state.strokeH, v);
+    strokePts = built.drawPts;
     const nPts = strokePts.length / 2;
-    strokeStyleSetup(nPts);
+    strokeStyleSetup(built.rawCount);
     if (!animate || reduceMotion || nPts < 4){
       drawSeg(0, nPts);
       return;

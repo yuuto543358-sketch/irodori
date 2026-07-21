@@ -461,6 +461,52 @@ function quantize(data, w, h, k){
   return { cents: cents.map(c => c.map(v => Math.round(v))), assign };
 }
 
+/* 「はいけい」を見つける: 画像の ふちの ピクセルぜんぶから スタートして、
+   となりあう ピクセルの いろが にているあいだは どんどん外に広げていく
+   (ペイントソフトの「バケツ」で ふちを ぜんぶ 選ぶのと おなじ しくみ)。
+   グラデーションのような ゆっくりした 色のかわりは たどれるが、被写体との
+   さかいめのような はっきりした 色のかわりでは 止まる。
+   「1歩ずつの 色のちがい(stepTol)」だけで判定すると、ちいさな段差が
+   ずっと つながって いつのまにか ぜんぜん ちがう色まで たどりついてしまう
+   ことがあるので、「その場所の スタート地点からの色のちがい(driftTol)」も
+   あわせて見て、あまり とおくまで 広がりすぎないようにする */
+function growBackgroundMask(w, h, stepTol, driftTol, colorAt){
+  const n = w * h;
+  const bg = new Uint8Array(n);
+  const seedR = new Float32Array(n), seedG = new Float32Array(n), seedB = new Float32Array(n);
+  const stack = [];
+  const push = (p, sr, sg, sb) => {
+    if (!bg[p]){ bg[p] = 1; seedR[p] = sr; seedG[p] = sg; seedB[p] = sb; stack.push(p); }
+  };
+  for (let x = 0; x < w; x++){
+    let c = colorAt(x); push(x, c[0], c[1], c[2]);
+    const p2 = (h - 1) * w + x; c = colorAt(p2); push(p2, c[0], c[1], c[2]);
+  }
+  for (let y = 0; y < h; y++){
+    let c = colorAt(y * w); push(y * w, c[0], c[1], c[2]);
+    const p2 = y * w + w - 1; c = colorAt(p2); push(p2, c[0], c[1], c[2]);
+  }
+  while (stack.length){
+    const p = stack.pop();
+    const x = p % w, y = (p - x) / w;
+    const pc = colorAt(p);
+    const sr = seedR[p], sg = seedG[p], sb = seedB[p];
+    const tryNeighbor = (nx, ny) => {
+      if (nx < 0 || ny < 0 || nx >= w || ny >= h) return;
+      const q = ny * w + nx;
+      if (bg[q]) return;
+      const qc = colorAt(q);
+      const dr = qc[0] - pc[0], dg = qc[1] - pc[1], db = qc[2] - pc[2];
+      if (dr * dr + dg * dg + db * db > stepTol) return;
+      const ddr = qc[0] - sr, ddg = qc[1] - sg, ddb = qc[2] - sb;
+      if (ddr * ddr + ddg * ddg + ddb * ddb > driftTol) return;
+      push(q, sr, sg, sb);
+    };
+    tryNeighbor(x - 1, y); tryNeighbor(x + 1, y); tryNeighbor(x, y - 1); tryNeighbor(x, y + 1);
+  }
+  return bg;
+}
+
 /* おなじ色でつながっている「かたまり(領域)」に番号をつける */
 function labelRegions(assign, w, h){
   const n = w * h;
@@ -941,12 +987,23 @@ function applyCenterBias(importance, w, h){
   }
 }
 
+/* はいけいと判定された場所は、りんかくの候補から ほとんど 消してしまう
+   (被写体だけを なぞらせたいので) */
+function suppressBackground(importance, colorR, colorG, colorB, w, h){
+  const colorAt = (p) => [colorR[p], colorG[p], colorB[p]];
+  const bg = growBackgroundMask(w, h, 0.012, 0.05, colorAt);
+  for (let p = 0; p < w * h; p++){
+    if (bg[p]) importance[p] *= 0.05;
+  }
+}
+
 /* 写真の「りんかく」を見つけて、それをなぞる1本せんの通り道を作る
    detailLevel = バーの「こまかさ」(30〜150)。大きいほど点が多く、こまかくなる
    もどりち: drawPts=じっさいに描く(なめらかにした)点、rawCount=もとの点の数(線の太さの計算につかう) */
 function buildTracePath(dark, colorR, colorG, colorB, w, h, detailLevel){
   const edges = edgeStrength(dark, colorR, colorG, colorB, w, h);
   applyCenterBias(edges, w, h);
+  suppressBackground(edges, colorR, colorG, colorB, w, h);
   const diag = Math.sqrt(w * w + h * h);
   const density = clamp((detailLevel - 30) / 120, 0, 1);
   const spacingPx = diag / 40 - density * (diag / 40 - diag / 160);
@@ -1134,6 +1191,20 @@ if (typeof document !== "undefined"){
     const edge = computeEdges(merged.label, w, h);
     const lineA = blurMask(blurMask(edge, w, h, 1), w, h, 1);
 
+    /* はいけいの領域を見つけて、ぬりえの対象から外す(まっしろの紙のままにする) */
+    const bgColorAt = (p) => { const o = p * 4; return [blurred[o], blurred[o + 1], blurred[o + 2]]; };
+    const bgMask = growBackgroundMask(w, h, 250, 900, bgColorAt);
+    const regionBg = new Uint8Array(merged.count);
+    {
+      const bgCount = new Int32Array(merged.count);
+      for (let p = 0; p < w * h; p++){
+        if (bgMask[p]) bgCount[merged.label[p]]++;
+      }
+      for (let i = 0; i < merged.count; i++){
+        if (bgCount[i] > merged.sizes[i] * 0.5) regionBg[i] = 1;
+      }
+    }
+
     setBusy(true, "ぬりえの じゅんびちゅう…");
     await sleep(30);
 
@@ -1146,7 +1217,15 @@ if (typeof document !== "undefined"){
     const P_LINE = [172, 156, 130];
     for (let p = 0; p < n; p++){
       const o = p * 4;
-      const c = cents[merged.colorOf[merged.label[p]]];
+      const lbl = merged.label[p];
+      if (regionBg[lbl]){
+        /* はいけいは、しゃしんの いろを つかわず まっしろい紙のままにする */
+        fin[o] = PAPER[0]; fin[o + 1] = PAPER[1]; fin[o + 2] = PAPER[2];
+        pap[o] = PAPER[0]; pap[o + 1] = PAPER[1]; pap[o + 2] = PAPER[2];
+        fin[o + 3] = 255; pap[o + 3] = 255;
+        continue;
+      }
+      const c = cents[merged.colorOf[lbl]];
       const a = Math.min(1, lineA[p] * 3.0);   /* 線のこさ(0=なし 〜 1=いちばんこい) */
       const inkW = a * 0.78;
       fin[o]     = (INK[0] * inkW + c[0] * (1 - inkW)) | 0;
@@ -1172,14 +1251,22 @@ if (typeof document !== "undefined"){
     state.finishedData = new ImageData(fin, w, h);
     state.paperData = new ImageData(pap, w, h);
     state.displayData = new ImageData(new Uint8ClampedArray(pap), w, h);
-    state.colored = new Uint8Array(merged.count);
+    /* はいけいの領域は、はじめから「ぬりおわった」あつかいにして、
+       ぬる対象(タップの的・すすみぐあい)から のぞく */
+    state.colored = Uint8Array.from(regionBg);
+    state.regionBg = regionBg;
     state.coloredPix = 0;
-    state.totalPix = n;
     state.complete = false;
 
     state.colorPix = new Float64Array(cents.length);
     state.coloredByColor = new Float64Array(cents.length);
-    for (let i = 0; i < merged.count; i++) state.colorPix[merged.colorOf[i]] += merged.sizes[i];
+    let totalPix = 0;
+    for (let i = 0; i < merged.count; i++){
+      if (regionBg[i]) continue;
+      state.colorPix[merged.colorOf[i]] += merged.sizes[i];
+      totalPix += merged.sizes[i];
+    }
+    state.totalPix = totalPix;
 
     state.finCanvas = document.createElement("canvas");
     state.finCanvas.width = w; state.finCanvas.height = h;
@@ -1425,7 +1512,7 @@ if (typeof document !== "undefined"){
     if (!state.paperData) return;
     state.gen++;
     active.length = 0;
-    state.colored = new Uint8Array(state.count);
+    state.colored = state.regionBg ? Uint8Array.from(state.regionBg) : new Uint8Array(state.count);
     state.coloredPix = 0;
     state.coloredByColor = new Float64Array(state.colorPix.length);
     state.displayData = new ImageData(new Uint8ClampedArray(state.paperData.data), state.w, state.h);
